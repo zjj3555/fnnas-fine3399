@@ -541,7 +541,12 @@ update_kernel() {
 
     # Update fnEnv.txt file
     fnenv_conf_file="/boot/fnEnv.txt"
-    [[ -f "${fnenv_conf_file}" ]] && sed -i "s|^kernelfile=.*|kernelfile=vmlinuz-${kernel_name}|g" ${fnenv_conf_file}
+    [[ -f "${fnenv_conf_file}" ]] && {
+        sed -i \
+            -e "s|^kernelfile=.*|kernelfile=vmlinuz-${kernel_name}|g" \
+            -e "s|^initrdfile=.*|initrdfile=uInitrd-${kernel_name}|g" \
+            "${fnenv_conf_file}"
+    }
 
     # Delete kernel tmpfiles
     rm -f *${PLATFORM}-${kernel_name}*.tar.gz sha256sums

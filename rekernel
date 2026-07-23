@@ -345,10 +345,55 @@ chroot_fnnas() {
     cd "${current_path}"
     echo -e "${STEPS} Preparing chroot environment..."
 
-    # Copy QEMU static binary for ARM64 emulation on x86_64 hosts
+    # Configure QEMU user emulation on x86_64 host
     if [[ "${arch_info}" == "x86_64" ]]; then
+        # Ensure binfmt_misc is mounted
+        if ! mountpoint -q /proc/sys/fs/binfmt_misc 2>/dev/null; then
+            modprobe binfmt_misc 2>/dev/null || true
+            mount -t binfmt_misc binfmt_misc /proc/sys/fs/binfmt_misc 2>/dev/null || true
+        fi
+
+        # Install qemu packages if the binary is still missing
+        if [[ ! -f "/usr/bin/${qemu_binary_arm64}" ]]; then
+            echo -e "${NOTE} [ ${qemu_binary_arm64} ] not found, installing qemu packages..."
+            if command -v apt-get &>/dev/null; then
+                # Try qemu-user-static first (Ubuntu ≤24.04), fall back to qemu-user-binfmt (Ubuntu 26.04+)
+                {
+                    DEBIAN_FRONTEND=noninteractive apt-get update -yq &&
+                        DEBIAN_FRONTEND=noninteractive apt-get install -yq --no-install-recommends qemu-user-static
+                } 2>/dev/null || {
+                    # Ubuntu 26.04+ provides qemu-user-binfmt instead of qemu-user-static
+                    echo -e "${NOTE} qemu-user-static not available, trying qemu-user-binfmt..."
+                    DEBIAN_FRONTEND=noninteractive apt-get install -yq --no-install-recommends qemu-user-binfmt binfmt-support 2>/dev/null ||
+                        echo -e "${WARNING} Failed to install qemu packages via apt-get."
+                }
+                # If qemu-user was installed (provides qemu-aarch64), copy it to the expected name
+                [[ ! -f "/usr/bin/${qemu_binary_arm64}" && -f "/usr/bin/qemu-aarch64" ]] && {
+                    cp -f "/usr/bin/qemu-aarch64" "/usr/bin/${qemu_binary_arm64}" 2>/dev/null ||
+                        echo -e "${WARNING} Failed to copy qemu-aarch64 to ${qemu_binary_arm64}."
+                }
+            else
+                echo -e "${WARNING} Package manager not recognized. Please install qemu-user-static or qemu-user-binfmt manually."
+            fi
+        fi
+
+        # Register ARM64 interpreter with binfmt_misc if not already registered
+        if [[ ! -f "/proc/sys/fs/binfmt_misc/qemu-aarch64" && ! -f "/proc/sys/fs/binfmt_misc/qemu-arm64" ]]; then
+            echo -e "${INFO} Registering [ ${qemu_binary_arm64} ] with binfmt_misc..."
+            if [[ -f "/proc/sys/fs/binfmt_misc/register" ]]; then
+                # The F flag makes the interpreter path fixed, so it works inside chroot too
+                echo ':qemu-aarch64:M:0:\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\xb7\x00:\xff\xff\xff\xff\xff\xff\xff\x00\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff:/usr/bin/qemu-aarch64-static:F' \
+                    >/proc/sys/fs/binfmt_misc/register 2>/dev/null ||
+                    error_msg "Failed to register qemu-aarch64 interpreter with binfmt_misc."
+            else
+                error_msg "binfmt_misc is not available. Cannot register ARM64 interpreter."
+            fi
+        fi
+
+        # Copy QEMU static binary to chroot environment
         if [[ -f "/usr/bin/${qemu_binary_arm64}" ]]; then
             echo -e "${INFO} Copying [ ${qemu_binary_arm64} ] to chroot..."
+            mkdir -p "${tmp_fnnas}/usr/bin"
             cp -f "/usr/bin/${qemu_binary_arm64}" "${tmp_fnnas}/usr/bin/"
         else
             # Check if QEMU binary already exists in the image

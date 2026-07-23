@@ -12,6 +12,8 @@
 # Copyright (C) 2021- https://github.com/unifreq/openwrt_packit
 # Copyright (C) 2021- https://github.com/ophub/fnnas
 #
+# Supported platforms: Allwinner (MBR), Amlogic (MBR), Rockchip (GPT)
+#
 # Command: fnnas-tf
 #
 #========================= Set default parameters ==========================
@@ -55,7 +57,7 @@ init_var() {
 disable_service() {
     if systemctl is-enabled resize-rootfs.service >/dev/null 2>&1; then
         systemctl disable resize-rootfs.service >/dev/null 2>&1
-        echo "Service resize-rootfs.service disabled"
+        echo -e "${INFO} Service resize-rootfs.service disabled"
     fi
 
     # Update configuration to prevent future resizing
@@ -65,7 +67,7 @@ disable_service() {
 # Check disk
 do_checkdisk() {
     # Find the partition where root is located
-    ROOT_PATH="$(df -P / | tail -n1 | awk '{print $1}')"
+    ROOT_PATH="$(findmnt -n -o SOURCE / 2>/dev/null || df -P / | tail -n1 | awk '{print $1}')"
     # Extract only the name (e.g., mmcblk0p2)
     ROOT_PTNAME="$(basename "${ROOT_PATH}")"
     [[ -z "${ROOT_PTNAME}" ]] && error_msg "Cannot find the partition corresponding to the root file system!"
@@ -92,7 +94,11 @@ do_checkdisk() {
         ;;
     esac
 
-    echo -e "${INFO} Target Disk: [ ${DISK_NAME} ], Root Partition: [ ${PART_NUM} ]"
+    # Detect partition table type (gpt or dos/mbr)
+    PT_TYPE="$(lsblk -n -o PTTYPE -d "/dev/${DISK_NAME}" 2>/dev/null | tr -d '[:space:]')"
+    [[ -z "${PT_TYPE}" ]] && PT_TYPE="unknown"
+
+    echo -e "${INFO} Target Disk: [ ${DISK_NAME} ], Root Partition: [ ${PART_NUM} ], PT Type: [ ${PT_TYPE} ]"
     sync && sleep 3
 }
 
@@ -100,43 +106,103 @@ do_checkdisk() {
 expansion_partition() {
     echo -e "${INFO} Expanding root partition..."
 
-    # Try to fix GPT backup header location
-    printf 'f\n' | parted ---pretend-input-tty /dev/${DISK_NAME} unit s print >/dev/null 2>&1
-    [[ "${?}" -eq "0" ]] && echo -e "${INFO} GPT header check completed."
+    # --- Step 1: Check if resize is needed ---
+    CURRENT_SIZE_BYTES="$(lsblk -b -n -o SIZE "/dev/${ROOT_PTNAME}" 2>/dev/null | head -n1)"
+    [[ -z "${CURRENT_SIZE_BYTES}" || "${CURRENT_SIZE_BYTES}" == "0" ]] && error_msg "Failed to get partition size."
+    CURRENT_SIZE_GiB=$((CURRENT_SIZE_BYTES / 1024 / 1024 / 1024))
 
-    # Check partition count
-    pt_num="$(parted -s /dev/${DISK_NAME} print 2>/dev/null | awk '$1~/[1-9]+/ {print $1}' | wc -l)"
-    [[ "${pt_num}" -ne "2" ]] && echo -e "${WARNING} Partition count is ${pt_num}, expected 2. Proceeding anyway..."
-
-    # Convert limit to bytes
-    LIMIT_BYTES=$((rootfs_limit_gib * 1024 * 1024 * 1024))
-
-    # Get disk size in bytes
-    DISK_SIZE_BYTES="$(lsblk -b -n -o SIZE -d "/dev/${DISK_NAME}")"
+    DISK_SIZE_BYTES="$(lsblk -b -n -o SIZE -d "/dev/${DISK_NAME}" 2>/dev/null)"
     [[ "${DISK_SIZE_BYTES}" =~ ^[0-9]+$ ]] || DISK_SIZE_BYTES="0"
+    DISK_SIZE_GiB=$((DISK_SIZE_BYTES / 1024 / 1024 / 1024))
 
-    # Check disk size and select expansion strategy
-    if [[ "${DISK_SIZE_BYTES}" -gt "${LIMIT_BYTES}" ]]; then
-        echo -e "${INFO} Strategy: Limit partition ${PART_NUM} to ${rootfs_limit_gib}GiB..."
-        printf 'Yes\n\n' | parted ---pretend-input-tty /dev/${DISK_NAME} resizepart ${PART_NUM} ${rootfs_limit_gib}GiB
+    echo -e "${INFO} Current partition: ${CURRENT_SIZE_GiB}GiB, Disk: ${DISK_SIZE_GiB}GiB"
+
+    # Calculate target end position in bytes for limited strategy
+    TARGET_LIMIT_BYTES="$((rootfs_limit_gib * 1024 * 1024 * 1024))"
+
+    if [[ "${DISK_SIZE_BYTES}" -gt "${TARGET_LIMIT_BYTES}" ]]; then
+        # === Limited strategy: disk > limit, resize to limit ===
+        # CRITICAL: Never shrink a partition — only grow
+        if [[ "${CURRENT_SIZE_BYTES}" -ge "${TARGET_LIMIT_BYTES}" ]]; then
+            echo -e "${INFO} Partition already >= ${rootfs_limit_gib}GiB target, skip resize."
+            disable_service
+            return 0
+        fi
     else
-        echo -e "${INFO} Strategy: Expand partition ${PART_NUM} to 100% (Full Disk)..."
-        printf 'Yes\n-1\n' | parted ---pretend-input-tty /dev/${DISK_NAME} resizepart ${PART_NUM} 100%
+        # === Full-disk strategy: disk <= limit, expand to 100% ===
+        # Skip if less than 1% free space remains (using byte-level comparison)
+        if [[ "${DISK_SIZE_BYTES}" -gt "0" ]]; then
+            REMAINING_BYTES=$((DISK_SIZE_BYTES - CURRENT_SIZE_BYTES))
+            # 1% of disk in bytes: DISK_SIZE_BYTES / 100
+            THRESHOLD_BYTES=$((DISK_SIZE_BYTES / 100))
+            if [[ "${REMAINING_BYTES}" -lt "${THRESHOLD_BYTES}" ]]; then
+                echo -e "${INFO} Partition already at 99%+ of disk, skip resize."
+                disable_service
+                return 0
+            fi
+        fi
     fi
 
-    # Inform the kernel of partition table changes
-    partprobe /dev/${DISK_NAME} 2>/dev/null
+    # --- Step 2: Resize partition (platform-aware) ---
+    #
+    # Partition table types by platform:
+    #   Allwinner: msdos (MBR) — bootloader at 8KB (SPL) + 40KB (U-Boot)
+    #   Amlogic:   msdos (MBR) — bootloader at sector 0 (444B) + sector 1+
+    #   Rockchip:  gpt         — bootloader at 32KB (idbloader) + 8MB (u-boot) + 12MB (trust)
+    #
+    if [[ "${PT_TYPE}" == "gpt" ]]; then
+        # === GPT path (Rockchip) ===
+        echo -e "${INFO} GPT partition table detected."
+
+        # Fix GPT backup header location (may be incorrect after writing image to larger disk)
+        printf 'f\n' | parted ---pretend-input-tty /dev/${DISK_NAME} unit MiB print >/dev/null 2>&1 || true
+
+        if [[ "${DISK_SIZE_BYTES}" -gt "$((rootfs_limit_gib * 1024 * 1024 * 1024))" ]]; then
+            echo -e "${INFO} Strategy: Limit partition ${PART_NUM} to ${rootfs_limit_gib}GiB..."
+            printf 'Yes\n' | parted ---pretend-input-tty \
+                /dev/${DISK_NAME} resizepart ${PART_NUM} ${rootfs_limit_gib}GiB 2>&1
+        else
+            echo -e "${INFO} Strategy: Expand partition ${PART_NUM} to 100% (Full Disk)..."
+            printf 'Yes\n' | parted ---pretend-input-tty \
+                /dev/${DISK_NAME} resizepart ${PART_NUM} 100% 2>&1
+        fi
+    else
+        # === MBR path (Allwinner / Amlogic) ===
+        echo -e "${INFO} MBR partition table detected."
+
+        if [[ "${DISK_SIZE_BYTES}" -gt "$((rootfs_limit_gib * 1024 * 1024 * 1024))" ]]; then
+            echo -e "${INFO} Strategy: Limit partition ${PART_NUM} to ${rootfs_limit_gib}GiB..."
+            printf 'Yes\n' | parted ---pretend-input-tty \
+                /dev/${DISK_NAME} resizepart ${PART_NUM} ${rootfs_limit_gib}GiB
+        else
+            echo -e "${INFO} Strategy: Expand partition ${PART_NUM} to 100% (Full Disk)..."
+            printf 'Yes\n' | parted ---pretend-input-tty \
+                /dev/${DISK_NAME} resizepart ${PART_NUM} 100%
+        fi
+    fi
+
+    # --- Step 3: Update kernel partition cache ---
+    partx --update /dev/${DISK_NAME} 2>/dev/null || true
     sync && sleep 3
 
+    # --- Step 4: Resize filesystem ---
     echo -e "${INFO} Expanding filesystem..."
     ROOTFS_TYPE="$(df -T / | tail -n1 | awk '{print $2}')"
 
     if [[ "${ROOTFS_TYPE}" == "btrfs" ]]; then
         btrfs filesystem resize max /
-        [[ "${?}" -ne "0" ]] && error_msg "[ btrfs ] operation failed."
+        if [[ "${?}" -ne "0" ]]; then
+            echo -e "${ERROR} [ btrfs ] operation failed, disabling service to prevent retry loop."
+            disable_service
+            exit 1
+        fi
     else
         resize2fs /dev/${ROOT_PTNAME}
-        [[ "${?}" -ne "0" ]] && error_msg "[ resize2fs ] operation failed."
+        if [[ "${?}" -ne "0" ]]; then
+            echo -e "${ERROR} [ resize2fs ] operation failed, disabling service to prevent retry loop."
+            disable_service
+            exit 1
+        fi
     fi
 
     echo -e "${SUCCESS} Partition expanded successfully."
